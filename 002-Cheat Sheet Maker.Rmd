@@ -1,0 +1,501 @@
+---
+title: "fantasy_cheat_sheet_maker"
+author: "Nick R. Bachelder"
+date: "2023-08-02"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(here)
+library(nflfastR)
+library(lme4)
+library(glmnet)
+library(gt)
+library(gtsummary)
+library(gtExtras)
+library(stringdist)
+library(fuzzyjoin)
+library(caret)
+library(xgboost)
+library(pbapply)
+library(ggridges)
+library(XML)
+library(RCurl)
+library(stringr)
+library(rlist)
+library(ggpubr)
+library(httr)
+library(jsonlite)
+library(XML)
+library(httpuv)
+general_pick_probs_by_adp <- read.csv("/Users/nickbachelder/Desktop/Personal Code/best-ball-data-bowl/SUMBISSION FINAL/best-ball_data_bowl_pdf/cumulative_pick_probs_by_adp_from_21_22.csv")
+```
+
+
+## Add EPL and EPL Maximization Functions
+
+```{r}
+# Calculate the expected positional loss from the first turn to all 216 turns.
+calculate_all_EPL <- function(draft_board) {
+  ret <- draft_board  %>% filter(position_name != "FB") %>% 
+    dplyr::select(player_name, projection_adp, total_fantasy_points, position_name) %>%
+    # Set ADP to integers for distributions
+    mutate(projection_adp = ceiling(projection_adp)) %>%
+    group_by(position_name) %>%
+    ungroup() %>%
+    # Merge in cumulative pick probabilties by ADP
+    left_join(general_pick_probs_by_adp, by = c("projection_adp")) %>%
+    group_by(theoretical_pick_number, position_name) %>%
+    # Order by true positional value (i.e. fantasy points)
+    arrange(theoretical_pick_number, position_name, desc(total_fantasy_points)) %>%
+    # Calculate the probability that all more valuable positional players are picked
+    mutate(prob_all_higher_ranked_positional_players_picked = cumprod(dplyr::lag(prob_picked, default = 1))) %>%
+    ungroup() %>%
+    # Calculate the probability a player is best at his position on current turn
+    mutate(prob_player_is_best_at_pos= (1-prob_picked)*prob_all_higher_ranked_positional_players_picked) %>%
+    # Calculate expected max positional value at turn
+    mutate(player_expected_value_if_best = total_fantasy_points*prob_player_is_best_at_pos) %>% 
+    group_by(theoretical_pick_number, position_name) %>%
+    mutate(expected_max_available_value_at_position = sum(player_expected_value_if_best)) %>% 
+    ungroup() %>%
+    # Subtract each players fantasy points from max positional value on every turn
+    mutate(EPL_for_player = total_fantasy_points - expected_max_available_value_at_position) %>%
+    group_by(theoretical_pick_number, position_name) %>%
+    # Calculate EPL as expected positional loss on each turn compared to best positional player on turn 1
+    # Also calculate expected and possible best positional players available at each turn
+    mutate(EPL = max(total_fantasy_points) - expected_max_available_value_at_position,
+           expected_best_available_player_at_position = paste0(player_name[which.max(prob_player_is_best_at_pos)][1], ' (', 
+                                                               round(max(prob_player_is_best_at_pos)[1]*100,2), '%)'),
+           possible_best_available_player_at_position_upper = 
+             paste0(player_name[prob_player_is_best_at_pos > 0.1 & total_fantasy_points==max(total_fantasy_points[prob_player_is_best_at_pos > 0.1])][1], ' (', 
+           round(prob_player_is_best_at_pos[prob_player_is_best_at_pos > 0.1 & 
+                                              total_fantasy_points==max(total_fantasy_points[prob_player_is_best_at_pos > 0.1])][1]*100,2), '%)')) %>%
+    ungroup() %>%
+    group_by(theoretical_pick_number) %>%
+    # Calculate best EPL pick looking N turns ahead from first pick
+    mutate(EPL_positional_selection = position_name[which.max(EPL)][1],
+           EPL_player_selection = player_name[which.max(EPL)][1]) %>%
+    ungroup() %>%
+    dplyr::select(theoretical_pick_number, player_name, position_name, 
+                  projection_adp, total_fantasy_points, EPL_for_player, prob_player_is_best_at_pos, prob_picked, EPL, expected_best_available_player_at_position,
+                  possible_best_available_player_at_position_upper, expected_max_available_value_at_position, EPL_positional_selection, EPL_player_selection)
+  return(ret)
+}
+
+# Plot EPL from turn 1
+EPL_Curve <- function(analyzed_round, year, n_turns = 100) {
+  analyzed_round <- analyzed_round %>% filter(!is.na(position_name)) %>%
+    dplyr::select(theoretical_pick_number, position_name, EPL, expected_best_available_player_at_position) %>% distinct()
+  max_y_axis <- 150
+  plot_df <- analyzed_round %>%
+    dplyr::rename(`Position Name` = position_name) %>%
+    ggplot(aes(x = theoretical_pick_number, y = EPL)) +
+    geom_line(aes(color = `Position Name`), size = 1.5) + 
+    theme_classic() +
+    xlab("Overall Pick") +
+    ylab("Expected Loss in Maximum Positional Value") +
+    ggtitle(paste(year, "EPL (Expected Positional Loss) Curve")) + 
+    coord_cartesian(xlim = c(1, n_turns), ylim=c(0, max_y_axis + (max_y_axis / 5))) +
+    # Add round lines
+      geom_vline(xintercept = 10) + geom_vline(xintercept = 20) + geom_vline(xintercept = 30) + geom_vline(xintercept = 40) + geom_vline(xintercept = 50) +
+       geom_vline(xintercept = 60) + geom_vline(xintercept = 70) + geom_vline(xintercept = 80) +
+      geom_label(aes(x = 5, y = max_y_axis + (max_y_axis / 5) - 20, label ="Round 1"), size = 2) + 
+      geom_label(aes(x = 15, y = max_y_axis + (max_y_axis / 5) - 20, label ="Round 2"), size = 2) +
+      geom_label(aes(x = 25, y = max_y_axis + (max_y_axis / 5) - 20, label ="Round 3"), size = 2) +
+      geom_label(aes(x = 35, y = max_y_axis + (max_y_axis / 5) - 20, label ="Round 4"), size = 2) +
+      geom_label(aes(x = 45, y = max_y_axis + (max_y_axis / 5) - 20, label ="Round 5"), size = 2) +
+      geom_label(aes(x = 55, y = max_y_axis + (max_y_axis / 5) - 20, label ="Round 6"), size = 2) +
+      geom_label(aes(x = 65, y = max_y_axis + (max_y_axis / 5) - 20, label ="Round 7"), size = 2)+
+      geom_label(aes(x = 75, y = max_y_axis + (max_y_axis / 5) - 20, label ="Round 8"), size = 2)
+  return(plot_df)
+}
+
+# Calculate time until next turn
+
+calculate_turns_until_next_pick <- function(current_turn, num_in_draft, limit = TRUE) {
+  # Define logic to determine current snake direction
+  snake_direction <- case_when((current_turn / num_in_draft) %% 2 == 1 ~ "up",
+                               (current_turn / num_in_draft) %% 2 == 0 ~ "down",
+                               ((floor(current_turn / num_in_draft) %% 2) == 0) & !((current_turn / num_in_draft) %% 2  %in% c(0, 1)) ~ "up", 
+                               (floor(current_turn / num_in_draft) %% 2) == 1  & !((current_turn / num_in_draft) %% 2  %in% c(0, 1)) ~ "down")
+  # Define logic to determine which pick order current drafter is
+  pick_order <- case_when((snake_direction == "up") & ((current_turn %% num_in_draft) != 0) ~ (current_turn %% num_in_draft), 
+                          (snake_direction == "down") & ((current_turn %% num_in_draft) != 0) ~ 1+(num_in_draft - (current_turn %% num_in_draft)),
+                          (snake_direction == "up") & ((current_turn %% num_in_draft) == 0) ~ as.numeric(num_in_draft),
+                          (snake_direction == "down") & ((current_turn %% num_in_draft) == 0) ~ 1)
+  # Define logic to calculate n until next turn
+  n_until_next_turn <- case_when(snake_direction == "up" ~ 2*(num_in_draft - pick_order),
+                                 snake_direction == "down" ~ (2*pick_order)-2)
+  if (n_until_next_turn < 6 & limit == TRUE) {
+    # there will be little to no positional loss below this treshold
+    # so set the minimum turns until next to 6
+    n_until_next_turn = 6 
+  }
+  return(n_until_next_turn)
+}
+
+# Get average per turn aepl between current turn and next turn for current pick (minimum look ahead is 6 picks)
+get_AEPL_from_pick <- function(pick, analyzed_round) {
+  # Caluclate picks ahead
+  picks_ahead <- calculate_turns_until_next_pick(current_turn = pick, num_in_draft = 10)
+  # Calculate EPL from turn 1
+  analyzed_round <- analyzed_round %>% dplyr::select(theoretical_pick_number, position_name, EPL,
+                                                     expected_best_available_player_at_position, possible_best_available_player_at_position_upper) %>% distinct()
+  # Filter to current turn and upcoming turn
+  analyzed_round %>% filter(theoretical_pick_number == pick | theoretical_pick_number == pick + picks_ahead) %>%
+  mutate(theoretical_pick_number = case_when(theoretical_pick_number == pick ~ "current_turn", TRUE ~ "upcoming_turn")) %>%
+  pivot_wider(values_from = c(EPL, expected_best_available_player_at_position,
+                              possible_best_available_player_at_position_upper), names_from = theoretical_pick_number) %>%
+    # Calculate AEPL as the difference between EPLs for each turn divided by duration of turns waited
+  mutate(avg_epl_per_turn = (EPL_upcoming_turn - EPL_current_turn)/picks_ahead, picks_ahead = picks_ahead,  EPL = EPL_upcoming_turn - EPL_current_turn) %>% 
+    dplyr::select(position_name, picks_ahead, possible_best_available_player_at_position_upper_current_turn, 
+                  avg_epl_per_turn, EPL, expected_best_available_player_at_position_upcoming_turn,
+                  possible_best_available_player_at_position_upper_upcoming_turn)
+}
+
+# Calcualte AEPL between curerent turn and next pick for all 96 turns
+get_all_AEPL <- function(analyzed_round) {
+  good_positional_picks <- do.call(rbind, lapply(seq(1, 96), function(turn) {
+    get_AEPL_from_pick(pick = turn, analyzed_round = analyzed_round) %>% mutate(pick = turn)
+  }))
+  return(good_positional_picks)
+}
+
+plot_AEPL <- function(analyzed_round, year, pick_order_turns_func = NA) {
+  # calculate all AEPL for each turn
+  good_positional_picks <- get_all_AEPL(analyzed_round)
+  # Plot positional value over course of draft
+  if (!is.na(pick_order_turns_func)) {
+    return(lapply(seq(1,10), function(x) {
+      turns = pick_order_turns_func(x)
+      good_positional_picks  %>%
+        filter(pick %in% turns) %>%
+        mutate(pick = unlist(lapply(1:length(turns), rep, times = 4))) %>%
+        dplyr::rename(`AEPL \n(Average Per Turn Expected Positional Loss Before Next Pick)` = avg_epl_per_turn) %>%
+        ggplot() +
+        geom_tile(aes(x = pick, y = position_name, fill = `AEPL \n(Average Per Turn Expected Positional Loss Before Next Pick)`))+ 
+        ggtitle(paste(year, "Pick Order", x, "Positional Value Throughout Draft")) +
+        xlab("Pick Number") + ylab("Position") + theme_classic()}))
+  }
+  turns <- 1:90
+  p2 <- good_positional_picks %>%
+    # Group by Player
+    mutate(possible_pick_abb = sub("^(\\S*\\s+\\S+).*", "\\1", possible_best_available_player_at_position_upper_current_turn)) %>%
+    # Select players with highest value at any point and find their max value
+    group_by(possible_pick_abb) %>% filter(avg_epl_per_turn == max(avg_epl_per_turn)) %>% ungroup() %>% arrange(desc(avg_epl_per_turn)) %>% 
+    dplyr::select(pick, position_name, avg_epl_per_turn, possible_best_available_player_at_position_upper_current_turn,
+                  expected_best_available_player_at_position_upcoming_turn) %>%
+    # Look at top 10
+    dplyr::slice(1:10) %>%
+    dplyr::rename(`Position` = position_name, 
+                  `Possible Value Pick \n(% Avail.)` = possible_best_available_player_at_position_upper_current_turn,
+                  `AEPL` = avg_epl_per_turn, 
+                  `Next Pick Most Likely Positional Best (% Best Next)` = expected_best_available_player_at_position_upcoming_turn)  %>% 
+    gt() %>% 
+    gt_theme_538() %>% 
+    data_color(
+      columns = vars(AEPL),
+      colors = scales::col_numeric(
+        palette = c("white", "#3fc1c9"),
+        domain = NULL
+      )) %>% tab_header(
+    title = md("Optimal Pick Locations for Most Valuable Players"),
+    subtitle = md("Using **AEPL (Average Expected Positional Loss Per Turn Before Next Pick)**"))
+  return(p2)
+}
+
+get_all_AEPL_from_pick <- function(pick, analyzed_round) {
+  # Calulcate turns until next pick
+  picks_ahead <- calculate_turns_until_next_pick(current_turn = pick, num_in_draft = 10)
+  ret <- analyzed_round %>% 
+    filter(!(position_name %in% c("DST", "K"))) %>%
+    dplyr::select(theoretical_pick_number, prob_picked, position_name, player_name, total_fantasy_points, expected_max_available_value_at_position) %>% 
+    # Filter to current turn and upcoming turn
+    filter(theoretical_pick_number == pick | theoretical_pick_number == pick + picks_ahead) %>%
+    mutate(theoretical_pick_number = case_when(theoretical_pick_number == pick ~ "current_turn", TRUE ~ "upcoming_turn")) %>%
+    pivot_wider(values_from = c(expected_max_available_value_at_position, prob_picked), names_from = theoretical_pick_number) %>%
+    # Calculate AEPL as difference between projected fantasy points of currently available player minus expected at next turn
+    mutate(AEPL_for_player =  (total_fantasy_points - expected_max_available_value_at_position_upcoming_turn)/picks_ahead) %>% 
+      dplyr::select(prob_picked_current_turn, total_fantasy_points, expected_max_available_value_at_position_upcoming_turn, position_name, player_name, AEPL_for_player) %>%
+      filter(prob_picked_current_turn < 0.5)
+  return(ret)
+}
+
+plot_all_AEPL_from_pick <- function(all_aepl_picks) {
+  picks_unformatted <- all_aepl_picks %>%
+    # Filter to only players than have a 20% chance or more of being available on current turn
+    filter(prob_picked_current_turn < 0.8) %>%
+    # Filter to top 3 at position for each turn
+    group_by(pick, position_name) %>% mutate(rank = rank(-AEPL_for_player, ties.method = 'first')) %>% filter(rank <= 3) %>% ungroup() %>%
+    mutate(player_name = paste0(player_name, " (", round(100-prob_picked_current_turn*100, 2), "% Avail.)"), AEPL_for_player = round(AEPL_for_player, 2)) %>%
+    dplyr::select(pick, position_name, player_name, AEPL_for_player)
+  
+  # Format table
+  picks_formatted <- do.call(cbind, lapply(c("QB", "RB", "WR", "TE"), function(x) {picks_unformatted %>% filter(position_name == x) %>%
+      dplyr::select(pick, player_name, AEPL_for_player) %>%
+      `colnames<-`(c(paste0('pick_', x), paste0('position_name_', x),  paste0('AEPL_for_player_', x)))})) %>%
+    dplyr::select(-c(pick_RB, pick_WR, pick_TE)) %>% dplyr::rename(pick = pick_QB)
+  
+  picks_further_formatted <- do.call(rbind, lapply(c(1, seq(1, 170)), 
+                                                   function(x){df <- picks_formatted %>% filter(pick == x)
+                                                   df[nrow(df)+1,] <- NA
+                                                   return(df)}))
+  # Output top best conditional AEPLs for each turn
+  picks_further_formatted %>%
+    dplyr::rename(Pick = pick, `Name QB` = position_name_QB, `QB AEPL` = AEPL_for_player_QB,
+                  `Name RB` = position_name_RB, `RB AEPL` = AEPL_for_player_RB,
+                  `Name TE` = position_name_TE, `TE AEPL` = AEPL_for_player_TE, `Name WR` = position_name_WR, `WR AEPL` = AEPL_for_player_WR) %>%
+    gt() %>%
+    sub_missing(
+    columns = everything(),
+    rows = everything(),
+    missing_text = "--") %>%
+      data_color(
+        columns = c(`QB AEPL`, `WR AEPL`, `TE AEPL`, `RB AEPL`),
+        colors = scales::col_numeric(
+          palette = c("white", "#3fc1c9"),
+          domain = NULL,
+        na.color = "transparent"
+        )) %>% tab_header(
+      title = md("Expected Conditional AEPL Throughout the **2022** Best Ball Draft"),
+      subtitle = md("Players must have at least 20% availability chance; Using **AEPL (Average Expected Positional Loss Per Turn Before Next Pick)**"))
+}
+
+calculate_all_pick_numbers <- function(pick_order){
+  i <- 2
+  current <- pick_order
+  all_turns <- c(pick_order)
+  while (length(all_turns) < 7) {
+    next_turn_in <- calculate_turns_until_next_pick(current_turn=current, num_in_draft=10, limit = FALSE)
+    all_turns[i] <- current+1+next_turn_in
+    current <- current+1+next_turn_in
+    i <- i+1
+  }
+  return(all_turns)
+}
+
+get_valuable_achievable_roster <- function(aepl_options, drafter_pick_order, picked_prob_cutoff = 0.2) {
+  best_for_each_turn_pick_order <- aepl_options %>% 
+    left_join(data.frame(pick_order = unlist(lapply(seq(1,10), rep, times = 7)), 
+             pick_number = rep(seq(1,7),times= 10), pick = unlist(lapply(seq(1, 10), calculate_all_pick_numbers))), by = "pick") %>%
+    filter(pick_order == drafter_pick_order, prob_picked_current_turn < picked_prob_cutoff) %>% 
+    mutate(needed = case_when(position_name == "QB" ~ 1, position_name == "TE" ~ 1, position_name == "RB" ~ 2, position_name == "WR" ~ 1)) %>%
+    group_by(pick, position_name) %>% filter(rank(desc(AEPL_for_player)) <= needed) 
+  
+  # Check every possible combination of top EPL players to maximize Roster EPL
+  all_combos <- expand.grid(lapply(unique(best_for_each_turn_pick_order$pick), function(x) {
+    best_for_each_turn_pick_order[best_for_each_turn_pick_order$pick == x,]$player_name})) 
+  
+  best_valid_combo <- all_combos %>%
+    `colnames<-`(unique(best_for_each_turn_pick_order$pick)) %>%
+    mutate(combination_num = row_number()) %>% pivot_longer(cols = paste0(unique(best_for_each_turn_pick_order$pick))) %>%
+    `colnames<-`(c("combo_num", "pick", "player_name")) %>% mutate(pick = as.numeric(pick)) %>%
+    left_join(best_for_each_turn_pick_order, by = c("pick", "player_name")) %>%
+    group_by(combo_num) %>% 
+    filter(length(unique(player_name)) == 7) %>% 
+    filter(sum(position_name == "QB") == 1, sum(position_name == "TE") == 1, (sum(position_name == "WR") == 2 | sum(position_name == "WR") == 3)) %>% 
+    filter(sum(AEPL_for_player) == max(sum(AEPL_for_player))) %>%
+    group_by(combo_num, position_name) %>%
+    ungroup() %>% filter(combo_num == min(combo_num))
+  
+  return(best_valid_combo)
+}
+
+plot_positional_value <- function(aepl_options, year, picked_prob_cutoff = 0.5) {
+  plot_df <- do.call(rbind, lapply(seq(1,10), function(x){get_valuable_achievable_roster(aepl_options=aepl_options, drafter_pick_order=x, 
+                                                                                         picked_prob_cutoff = picked_prob_cutoff) %>%
+      dplyr::select(player_name, prob_picked_current_turn, position_name, AEPL_for_player, pick_order, pick_number)}))
+  
+  plot1 <- plot_df %>%
+    dplyr::rename(EPL = AEPL_for_player, `Position Name` = position_name) %>%
+    ggplot() +
+    geom_tile(aes(x = pick_number, y = as.factor(pick_order), fill = `Position Name`, alpha = EPL)) +
+    ggtitle(label = paste(year, "Best Ball Draft Positional Value by Roster EPL Maximization"), 
+            subtitle = "EPL: Per Turn Expected Positional Loss, Minimum 50% Chance of Pick Availability") +
+    theme_classic() + xlab("Pick Number") + ylab("Drafter Pick Order")
+  return(list('df' = plot_df, 'plot_1' = plot1))
+}
+
+get_draft_plan_by_pick_order <- function(positional_value_df){
+  positional_value_df  %>%
+  mutate(label = paste0(player_name, " (", 100-round(prob_picked_current_turn*100, 2), "% Avail.)"), pick_order = paste0("Pick Order ",pick_order)) %>%
+  dplyr::select(pick_number, pick_order, label)%>%
+  dplyr::rename(`Pick Number` = pick_number) %>%
+  pivot_wider(names_from = pick_order, values_from = c(label)) %>% gt()  %>%
+    gt_theme_538()%>% tab_header(
+    title = md("Target Players For 2023 Best Ball Draft by Pick Order and Number"),
+    subtitle = md("**Using EPL Roster Maximizationl; Pick Order 1-6**"))
+}
+```
+
+
+
+
+```{r}
+pull_projections <- function(positions = c('qb', 'rb', 'wr', 'te', 'k', 'dst')) {
+  pos <- positions[1]
+  theurl <- getURL(paste0("https://www.fantasypros.com/nfl/projections/", pos, ".php?week=draft"), .opts = list(ssl.verifypeer = FALSE) )
+  tables <- readHTMLTable(theurl)
+  tables <- list.clean(tables, fun = is.null, recursive = FALSE)$data
+  colnames(tables) <- c('PLAYER', 'PASS_ATT', 'PASS_COMP', 'PASS_YDS', 'PASS_TDS', 'PASS_INTS', 'RUSH_ATT', 'RUSH_YRD', 'RUSH_TDS', 'FL', 'FPTS')
+  tables$POS <- pos
+  positions <- positions[positions != positions[1]]
+  
+  scrape_df <- data.frame(matrix(nrow = 0, ncol = ncol(tables))) %>% `colnames<-`(names(tables))
+  scrape_df <- rbind(scrape_df, tables)
+  
+  
+  for (pos in positions) {
+    theurl <- getURL(paste0("https://www.fantasypros.com/nfl/projections/", pos, ".php?week=draft&scoring=HALF&week=draft"), .opts = list(ssl.verifypeer = FALSE) )
+    tables <- readHTMLTable(theurl)
+    tables <- list.clean(tables, fun = is.null, recursive = FALSE)$data
+    if (pos %in% c('wr', 'rb')) {
+      colnames(tables) <- c('PLAYER', 'RUSH_ATT', 'RUSH_YRD', 'RUSH_TDS', 'REC', 'REC_YRD', 'REC_TDS', 'FL', 'FPTS')
+    }
+    if (pos %in% c('te')) {
+      colnames(tables) <- c('PLAYER', 'REC', 'REC_YRD', 'REC_TDS', 'FL', 'FPTS')
+    }
+    if (pos %in% c('dst')) {
+      tables <- tables %>% dplyr::rename('PLAYER' = 'Player')
+    }
+    if (pos %in% c('k')) {
+      tables <- tables %>% dplyr::rename('PLAYER' = 'Player')
+    }
+    tables$POS <- pos
+    
+    if (!( all(colnames(tables) %in% colnames(scrape_df)) & all(colnames(scrape_df) %in% colnames(tables)) )) {
+      not_in_scrape <- setdiff(colnames(tables), colnames(scrape_df))
+      not_in_scrape <- data.frame(matrix(nrow = nrow(scrape_df), ncol = length(not_in_scrape))) %>% `colnames<-`(not_in_scrape) 
+      not_in_tables <- setdiff(colnames(scrape_df), colnames(tables))
+      not_in_tables <- data.frame(matrix(nrow = nrow(tables), ncol = length(not_in_tables))) %>% `colnames<-`(not_in_tables)
+      
+      tables <- cbind(tables, not_in_tables)
+      scrape_df <- cbind(scrape_df, not_in_scrape)
+    }
+    scrape_df <- rbind(scrape_df, tables) %>%
+      dplyr::select(PLAYER, FPTS, POS) %>%
+    mutate(PLAYER =str_extract(PLAYER, "\\S+\\s+\\S+"))
+  }
+  
+  return(scrape_df)
+}
+
+get_adp <- function() {
+  theurl <- getURL(paste0("https://www.fantasypros.com/nfl/adp/overall.php"), .opts = list(ssl.verifypeer = FALSE) )
+  tables <- readHTMLTable(theurl)
+  tables <- list.clean(tables, fun = is.null, recursive = FALSE)$data %>%
+    dplyr::select(`Player Team (Bye)`, AVG) %>% dplyr::rename(PLAYER = `Player Team (Bye)`, ADP = AVG)  %>%
+    mutate(PLAYER =str_extract(PLAYER, "\\S+\\s+\\S+"), ADP = ifelse(is.na(ADP), 216, ADP))
+  return(tables)
+}
+
+get_ADP_yahoo_only <- function() {
+  theurl <- getURL(paste0("https://www.fantasypros.com/nfl/adp/half-point-ppr-overall.php"), .opts = list(ssl.verifypeer = FALSE) )
+  tables <- readHTMLTable(theurl)
+  tables <- list.clean(tables, fun = is.null, recursive = FALSE)$data %>%
+    dplyr::select(`Player Team (Bye)`, Yahoo) %>% dplyr::rename(PLAYER = `Player Team (Bye)`, ADP = Yahoo)  %>%
+    mutate(PLAYER =str_extract(PLAYER, "\\S+\\s+\\S+"), ADP = ifelse(is.na(ADP), 216, ADP))
+  return(tables)
+}
+
+pull_data <- function(positions = c('qb', 'rb', 'wr', 'te', 'k', 'dst')) {
+  proj <- pull_projections(positions = c('qb', 'rb', 'wr', 'te', 'k', 'dst'))
+  adp <- get_ADP_yahoo_only()
+  ret <- proj %>% left_join(adp, by = "PLAYER") %>%
+    dplyr::rename(player_name = PLAYER, projection_adp = ADP, total_fantasy_points = FPTS, position_name = POS) %>%
+    mutate(total_fantasy_points = as.numeric(total_fantasy_points), projection_adp = as.numeric(projection_adp), position_name = toupper(position_name))
+  return(ret)
+}
+
+draft_board <- pull_data()
+draft_board %>% arrange(desc(total_fantasy_points)) %>% arrange(projection_adp)
+```
+
+```{r, warning = FALSE}
+analyzed_round <- calculate_all_EPL(draft_board)
+```
+
+```{r}
+all_aepl_picks <- do.call(rbind, lapply(seq(1, 170), function(turn) {
+    get_all_AEPL_from_pick(pick = turn, analyzed_round = analyzed_round) %>% mutate(pick = turn)
+}))
+```
+
+
+
+
+
+
+```{r}
+get_valuable_achievable_roster_fantasy_points <- function(aepl_options, drafter_pick_order, picked_prob_cutoff = 0.2) {
+  best_for_each_turn_pick_order <- aepl_options %>% 
+    left_join(data.frame(pick_order = unlist(lapply(seq(1,10), rep, times = 7)), 
+             pick_number = rep(seq(1,7),times= 10), pick = unlist(lapply(seq(1, 10), calculate_all_pick_numbers))), by = "pick") %>%
+    filter(pick_order == drafter_pick_order, prob_picked_current_turn < picked_prob_cutoff) %>% 
+    mutate(needed = case_when(position_name == "QB" ~ 1, position_name == "TE" ~ 1, position_name == "RB" ~ 2, position_name == "WR" ~ 1)) %>%
+    group_by(pick, position_name) %>% filter(rank(desc(AEPL_for_player)) <= needed) 
+  
+  # Check every possible combination of top EPL players to maximize Roster EPL
+  all_combos <- expand.grid(lapply(unique(best_for_each_turn_pick_order$pick), function(x) {
+    best_for_each_turn_pick_order[best_for_each_turn_pick_order$pick == x,]$player_name})) 
+  
+  best_valid_combo <- all_combos %>%
+    `colnames<-`(unique(best_for_each_turn_pick_order$pick)) %>%
+    mutate(combination_num = row_number()) %>% pivot_longer(cols = paste0(unique(best_for_each_turn_pick_order$pick))) %>%
+    `colnames<-`(c("combo_num", "pick", "player_name")) %>% mutate(pick = as.numeric(pick)) %>%
+    left_join(best_for_each_turn_pick_order, by = c("pick", "player_name")) %>%
+    group_by(combo_num) %>% 
+    filter(length(unique(player_name)) == 7) %>% 
+    filter(sum(position_name == "QB") == 1, sum(position_name == "TE") == 1, (sum(position_name == "WR") == 2 | sum(position_name == "WR") == 3)) %>% 
+    filter(sum(total_fantasy_points) == max(sum(total_fantasy_points))) %>%
+    group_by(combo_num, position_name) %>%
+    ungroup() %>% filter(combo_num == min(combo_num))
+  
+  return(best_valid_combo)
+}
+
+plot_positional_value_pts <- function(aepl_options, year, picked_prob_cutoff = 0.5) {
+  plot_df <- do.call(rbind, lapply(seq(1,10), function(x){get_valuable_achievable_roster_fantasy_points(aepl_options=aepl_options, drafter_pick_order=x, 
+                                                                                         picked_prob_cutoff = picked_prob_cutoff) %>%
+      dplyr::select(player_name, prob_picked_current_turn, position_name, total_fantasy_points, pick_order, pick_number)}))
+  
+  plot1 <- plot_df %>%
+    dplyr::rename(fantasy_points_proj = total_fantasy_points, `Position Name` = position_name) %>%
+    ggplot() +
+    geom_tile(aes(x = pick_number, y = as.factor(pick_order), fill = `Position Name`, alpha = fantasy_points_proj)) +
+    ggtitle(label = paste(year, "Best Ball Draft Positional Value by Roster Fantasy Points Maximization"), 
+            subtitle = "Minimum 50% Chance of Pick Availability") +
+    theme_classic() + xlab("Pick Number") + ylab("Drafter Pick Order")
+  return(list('df' = plot_df, 'plot_1' = plot1))
+}
+
+pos_value_pts_maximization <- plot_positional_value_pts(aepl_options=all_aepl_picks, year="2023", picked_prob_cutoff = 0.2)
+pos_value_pts_maximization$plot_1
+get_draft_plan_by_pick_order(pos_value_pts_maximization$df)
+```
+
+```{r}
+pos_value_pts_maximization <- plot_positional_value_pts(aepl_options=all_aepl_picks, year="2023", picked_prob_cutoff = 0.5)
+pos_value_pts_maximization$plot_1
+get_draft_plan_by_pick_order(pos_value_pts_maximization$df)
+```
+
+
+```{r}
+pos_value_pts_maximization$df %>% group_by(pick_order) %>% dplyr::summarise(total = sum(total_fantasy_points)) %>%
+  ungroup() %>%
+  arrange(desc(total))
+```
+
+
+
+
+
+
+
+
+
